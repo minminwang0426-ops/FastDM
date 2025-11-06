@@ -217,7 +217,7 @@ def compute_clip_score_group(prompts, images):
         """
         images: type=array, shape=[h,w,3], range=[0,1]
         """
-        clip_score = clip_score_fn(torch.tensor(image).permute(2, 0, 1), prompt).detach()
+        clip_score = clip_score_fn(torch.tensor(image).permute(2, 0, 1).to("npu"), prompt).detach()
         return round(float(clip_score), 4)
 
     for i in range(len(prompts)):
