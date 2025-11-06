@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 
 from fastdm.kernel.operators_set import quantize_to_fp8, quantize_to_int8, fp8_matmul, int8_matmul
 from fastdm.utils.quantization import int8_quantization, fp8_quantization
@@ -70,8 +71,16 @@ class QLinear:
             x_quant, x_scale = quantize_to_fp8(input_tensor)
             output_tensor = fp8_matmul(x_quant, self.weight, x_scale, self.weight_quant_scale, input_tensor.dtype, bias=self.bias)
         elif torch.int8 == self.weight.dtype:
-            x_quant, x_scale, x_zp = quantize_to_int8(input_tensor, symmetric=False)
-            output_tensor = int8_matmul(x_quant, self.weight, x_scale, self.weight_quant_scale, input_tensor.dtype, self.weight_asym_sumcol, x_zp, bias=self.bias)
+            x_quant, scale = torch_npu.npu_dynamic_quant(input_tensor)
+            output_tensor = torch_npu.npu_quant_matmul(
+                x_quant,
+                self.weight,
+                self.weight_quant_scale,
+                # offset = offset,
+                pertoken_scale = scale,
+                bias=self.bias,
+                output_dtype=input_tensor.dtype
+            )
         else:
             output_tensor = torch.addmm(self.bias, input_tensor, self.weight) if self.bias is not None else torch.mm(input_tensor, self.weight)
         
