@@ -206,11 +206,14 @@ def get_1d_rotary_pos_embed(
         / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device)[: (dim // 2)] / dim))
         / linear_factor
     )  # [D/2]
-    freqs = torch.outer(pos, freqs)  # type: ignore   # [S, D/2]
+    freqs = torch.outer(pos, freqs).to(torch.float32)  # type: ignore   # [S, D/2]
     if use_real and repeat_interleave_real:
         # flux, hunyuan-dit, cogvideox
-        freqs_cos = freqs.cos().repeat_interleave(2, dim=1).float()  # [S, D]
-        freqs_sin = freqs.sin().repeat_interleave(2, dim=1).float()  # [S, D]
+        freqs_cos = freqs.cos()
+        freqs_sin = freqs.sin()
+        freqs_cos = torch.stack([freqs_cos, freqs_cos], dim=-1).reshape(freqs.shape[0], -1)
+        freqs_sin = torch.stack([freqs_sin, freqs_sin], dim=-1).reshape(freqs.shape[0], -1)
+
         return freqs_cos, freqs_sin
     elif use_real:
         # stable audio, allegro
