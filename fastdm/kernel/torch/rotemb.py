@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 
 from fastdm.kernel.registry import kernel_registry
 
@@ -56,8 +57,14 @@ def rotary_pos_embedding_torch(query: torch.Tensor,
     
     q_shape, k_shape = query.shape, key.shape
 
-    query_rot = _apply_rotary_emb_torch(query.view(q_shape[0], q_shape[1], -1, head_size), cos, sin, is_neox)
-    key_rot = _apply_rotary_emb_torch(key.view(k_shape[0], k_shape[1], -1, head_size), cos, sin, is_neox)
+
+    cos = torch.stack([cos,cos], dim=-1).reshape(cos.shape[0], -1) 
+    sin = torch.stack([sin,sin], dim=-1).reshape(sin.shape[0], -1) 
+    cos =  cos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, rotary_dim)
+    sin =  sin.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, rotary_dim)
+    
+    query_rot = torch_npu.npu_rotary_mul(query.view(q_shape[0], q_shape[1], -1, head_size), cos, sin, rotary_mode="interleave")
+    key_rot = torch_npu.npu_rotary_mul(key.view(k_shape[0], k_shape[1], -1, head_size), cos, sin, rotary_mode="interleave")
 
     query.copy_(query_rot.reshape(q_shape))
     key.copy_(key_rot.reshape(k_shape))
