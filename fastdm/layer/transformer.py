@@ -4,12 +4,12 @@
 from typing import Optional, Tuple
 
 import torch
-from einops import rearrange
+import torch_npu
 
 from fastdm.layer.qlinear import QLinear
 from fastdm.layer.activations import *
 from fastdm.kernel.operators_set import rms_norm, rotary_pos_embedding, scaled_dot_product_attention
-from fastdm.sparse.xsparse import SparseAttn
+
 
 class FeedForward:
     r"""
@@ -148,6 +148,7 @@ class Attention:
         elementwise_affine: bool = True,
         is_causal: bool = False,
         data_type = torch.bfloat16,
+        fp8_attn_: bool = False,
     ):
         super().__init__()
 
@@ -168,6 +169,7 @@ class Attention:
         self.context_pre_only = context_pre_only
         self.pre_only = pre_only
         self.is_causal = is_causal
+        self.fp8_attn_ = fp8_attn_
 
         self.eps = eps
 
@@ -272,9 +274,10 @@ class Attention:
         head_dim = inner_dim // self.heads
 
         if self.norm_q_weight is not None:
-            query = rms_norm(query.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_q_weight, eps=self.eps).view(batch_size, -1, inner_dim)
+            query = torch_npu.npu_rms_norm(query.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_q_weight, epsilon=self.eps)[0].view(batch_size, -1, inner_dim)
         if self.norm_k_weight is not None:
-            key = rms_norm(key.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_k_weight, eps=self.eps).view(batch_size, -1, self.inner_kv_dim)
+            key = torch_npu.npu_rms_norm(key.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_k_weight, epsilon=self.eps)[0].view(batch_size, -1, self.inner_kv_dim)
+
 
         # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
@@ -285,9 +288,9 @@ class Attention:
             encoder_hidden_states_value_proj = encoder_hidden_states_qkv_proj[:, :, (self.inner_dim + self.inner_kv_dim):]
 
             if self.norm_added_q_weight is not None:
-                encoder_hidden_states_query_proj = rms_norm(encoder_hidden_states_query_proj.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_added_q_weight, eps=self.eps).view(batch_size, -1, inner_dim)
+                encoder_hidden_states_query_proj = torch_npu.npu_rms_norm(encoder_hidden_states_query_proj.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_added_q_weight, epsilon=self.eps)[0].view(batch_size, -1, inner_dim)
             if self.norm_added_k_weight is not None:
-                encoder_hidden_states_key_proj = rms_norm(encoder_hidden_states_key_proj.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_added_k_weight, eps=self.eps).view(batch_size, -1, self.inner_kv_dim)
+                encoder_hidden_states_key_proj = torch_npu.npu_rms_norm(encoder_hidden_states_key_proj.unflatten(-1, (self.heads, -1)).contiguous(), self.norm_added_k_weight, epsilon=self.eps)[0].view(batch_size, -1, self.inner_kv_dim)
 
             # attention
             query = torch.cat([encoder_hidden_states_query_proj, query], dim=1)
@@ -297,7 +300,7 @@ class Attention:
         if image_rotary_emb is not None:
             rotary_pos_embedding(query, key, head_dim, image_rotary_emb, is_neox=False)
 
-        hidden_states = scaled_dot_product_attention(query, key, value, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale)
+        hidden_states = scaled_dot_product_attention(query, key, value, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale, fp8_attn_=self.fp8_attn_)
         hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
@@ -448,7 +451,6 @@ class WanAttention:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        sparse_attn: Optional[SparseAttn] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -504,30 +506,11 @@ class WanAttention:
             key_img = self.add_k_proj.forward(encoder_hidden_states_img)
             value_img = self.add_v_proj.forward(encoder_hidden_states_img)
             key_img = rms_norm(key_img, self.norm_added_k_weight, self.eps)
-            hidden_states_img = scaled_dot_product_attention(query, key_img, value_img, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale)
+            hidden_states_img = scaled_dot_product_attention(query, key_img, value_img, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale, fp8_attn_=False)
+
+        hidden_states = scaled_dot_product_attention(query, key, value, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale, fp8_attn_=False)
+
         
-        if sparse_attn is not None and self.cross_attention_dim_head is None:  # sparse attention for self-attention
-            current_step = sparse_attn.config.current_steps_callback() if sparse_attn.config.current_steps_callback() is not None else 0
-            layer_index = kwargs.get("layer_index", 0)
-            if current_step < sparse_attn.config.dense_steps or layer_index < sparse_attn.config.dense_layers:
-                # use dense attention
-                hidden_states = scaled_dot_product_attention(query, key, value, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale)
-            else:
-                query = query.unflatten(2, (self.heads, -1))
-                key = key.unflatten(2, (self.heads, -1))
-                value = value.unflatten(2, (self.heads, -1))
-
-                batch_size = query.shape[0]
-                query = rearrange(query, "b s h d -> (b s) h d")
-                key = rearrange(key, "b s h d -> (b s) h d")
-                value = rearrange(value, "b s h d -> (b s) h d")
-                # apply radial attention
-                hidden_states = sparse_attn.apply(query=query, key=key, value=value)
-                hidden_states = rearrange(hidden_states, "(b s) h d -> b s h d", b=batch_size)
-                hidden_states = hidden_states.flatten(2, 3)
-        else:
-            hidden_states = scaled_dot_product_attention(query, key, value, self.heads, self.sdpa_kv_heads, self.sdpa_head_dim, is_causal=self.is_causal, scale=self.scale)
-
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
 
