@@ -31,15 +31,21 @@ def sdpa_torch(
     """
     b, t, c = query.size()
 
-    q = query.view(query.size(0), query.size(1), num_q_heads, head_dim).transpose(1, 2)
-    k = key.view(key.size(0), key.size(1), num_kv_heads, head_dim).transpose(1, 2)
-    v = value.view(value.size(0), value.size(1), num_kv_heads, head_dim).transpose(1, 2)
+    #q = query.view(query.size(0), query.size(1), num_q_heads, head_dim).transpose(1, 2)
+    #k = key.view(key.size(0), key.size(1), num_kv_heads, head_dim).transpose(1, 2)
+    #v = value.view(value.size(0), value.size(1), num_kv_heads, head_dim).transpose(1, 2)
 
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, is_causal=is_causal, scale=scale
-        )
+    #attn_output = torch.nn.functional.scaled_dot_product_attention(
+     #       q, k, v, dropout_p=0.0, is_causal=is_causal, scale=scale
+     #   )
 
-    attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, c)
+    #attn_output = attn_output.transpose(1, 2).contiguous().view(b, t, c)
+    from mindiesd import attention_forward
+    q = query.view(query.size(0), query.size(1), num_q_heads, head_dim)
+    k = key.view(key.size(0), key.size(1), num_kv_heads, head_dim)
+    v = value.view(value.size(0), value.size(1), num_kv_heads, head_dim)
+    attn_output = attention_forward(q,k,v,dropout_p=0.0, is_causal=is_causal, scale=scale, op_type="ascend_laser_attention", layout="BNSD", opt_mode="manual")
+    attn_output = attn_output.contiguous().view(b, t, c)
     return attn_output
 
 @kernel_registry.register('sdpa_sparse', 'torch')
