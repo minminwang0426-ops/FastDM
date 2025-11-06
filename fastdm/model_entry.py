@@ -9,13 +9,12 @@ import gc
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
-
 import numpy as np
 
 import torch
 import torch.nn as nn
 
-from diffusers import DiffusionPipeline, FluxPipeline， WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline
+from diffusers import DiffusionPipeline, FluxPipeline, WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline
 from diffusers.utils import load_image
 
 from fastdm.model.sdxl import SDXLUNetModelCore
@@ -428,7 +427,9 @@ class WanTransformer3DWrapper(BaseModelWrapper):
         self.config = self._create_diffusers_config(
             in_channels=self.model_config_dict['in_channels'],
             out_channels=self.model_config_dict['out_channels'],
-            dtype=dtype
+            dtype=dtype,
+            image_dim=self.model_config_dict['image_dim'],
+            patch_size=self.model_config_dict['patch_size'],
         )
         
         self.dtype = dtype
@@ -451,7 +452,8 @@ class WanTransformer3DWrapper(BaseModelWrapper):
                 rope_max_seq_len = self.model_config_dict['rope_max_seq_len'],
                 data_type=self.config.dtype, 
                 quant_dtype=quant_type,
-                cache=cache
+                cache=cache,
+                sparse_attn=kwargs.get('sparse_attn', None),
         )
         
         if isinstance(ckpt_path, dict) or os.path.exists(ckpt_path):
@@ -537,7 +539,9 @@ class FastDMEngine:
                  kernel_backend="cuda",
                  cache_config=None,
                  oom_resolve=False,
-                 use_diffusers = True):
+                 use_diffusers = True,
+                 task="t2i",
+                 sparse_attn_config=None):
         """
         初始化 FastDM 引擎
         
@@ -551,11 +555,16 @@ class FastDMEngine:
             kernel_backend: 后端类型 (cuda/triton/torch)
             cache_config: 缓存配置文件路径
             oom_resolve: 是否启用 OOM 解决方案
+            use_diffusers: 是否使用 diffusers 库
+            task: 任务类型 (t2i/t2v/i2i/i2v)
+            sparse_attn_config: 稀疏注意力配置文件路径
         """
         self.architecture = architecture
         self.device = device
         self.oom_resolve = oom_resolve
         self.use_diffusers = use_diffusers
+        self.task = task
+        self.sparse_attn_config = sparse_attn_config
         
         # 设置设备
         torch.cuda.set_device(device)
@@ -574,12 +583,20 @@ class FastDMEngine:
         # 初始化caching
         if cache_config:
             self.cache = AutoCache.from_json(cache_config)
-            if architecture == "wan":
+            if architecture == "wan" or architecture == "wan-i2v":
                 self.cache_2 = AutoCache.from_json(cache_config)
         else:
             self.cache = None
             self.cache_2 = None
 
+        # 初始化sparse attention
+        if sparse_attn_config:
+            if architecture not in ["wan", "wan-i2v"]:
+                raise ValueError("Sparse attention is only supported for Wan models")
+            self.sparse_attn = SparseAttn.from_json(sparse_attn_config)
+        else:
+            self.sparse_attn = None
+            
         # 初始化模型
         self._init_model(model_path, kernel_backend)
         
@@ -595,6 +612,12 @@ class FastDMEngine:
                 model_path,
                 vae=vae,
                 torch_dtype=torch.bfloat16
+            )
+        elif self.architecture == "wan-i2v":
+            self.pipe = WanImageToVideoPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                use_safetensors=True
             )
         else:
             self.pipe = DiffusionPipeline.from_pretrained(
@@ -612,10 +635,13 @@ class FastDMEngine:
             if self.cache:
                 self.cache.config.current_steps_callback = lambda: self.pipe.scheduler.step_index
                 self.cache.config.total_steps_callback = lambda: self.pipe.scheduler.timesteps.shape[0]
-                if self.architecture == "wan": # wan model use diff cache for low noise and high noise
+                if self.architecture == "wan" or self.architecture == "wan-i2v": # wan model use diff cache for low noise and high noise
                     self.cache_2.config.current_steps_callback = lambda: self.pipe.scheduler.step_index
                     self.cache_2.config.total_steps_callback = lambda: self.pipe.scheduler.timesteps.shape[0]
-
+            
+            # 设置radial attn current step回调
+            if self.sparse_attn and self.sparse_attn.config.sparse_algorithm == "radial":     
+                self.sparse_attn.config.current_steps_callback = lambda: self.pipe.scheduler.step_index
                 
             # 替换模型实现
             if self.architecture == "sdxl":
@@ -644,14 +670,15 @@ class FastDMEngine:
                 if self.oom_resolve and model_type in ["qwen", "flux"]:
                     self._setup_oom_resolve(model_type)
 
-            elif "wan" == self.architecture:
+            elif "wan" == self.architecture or "wan-i2v" == self.architecture:
                 self.pipe.transformer = create_model("wan", 
                                 ckpt_path=self.pipe.transformer.state_dict(), 
                                 dtype=self.dtype, 
                                 quant_type=self.quant_type, 
                                 kernel_backend=kernel_backend, 
                                 config_json=f"{self.model_path}/transformer/config.json",
-                                cache=self.cache).eval()
+                                cache=self.cache,
+                                sparse_attn=self.sparse_attn).eval()
                 if hasattr(self.pipe, 'transformer_2') and self.pipe.transformer_2 is not None:
                     self.pipe.transformer_2 = create_model("wan", 
                                     ckpt_path=self.pipe.transformer_2.state_dict(), 
@@ -659,7 +686,8 @@ class FastDMEngine:
                                     quant_type=self.quant_type, 
                                     kernel_backend=kernel_backend, 
                                     config_json=f"{self.model_path}/transformer_2/config.json",
-                                    cache=self.cache_2).eval()
+                                    cache=self.cache_2,
+                                    sparse_attn=self.sparse_attn).eval()
             else:
                 raise ValueError(
                     f"The {self.architecture} model is not supported!!!"
@@ -706,7 +734,7 @@ class FastDMEngine:
         Args:
             prompt: 提示词
             negative_prompt: 负面提示词
-            src_image: 输入图像
+            src_image: 输入图像路径
             num_frames: 视频帧数
             fps: 视频帧率
             steps: 推理步数
@@ -727,15 +755,27 @@ class FastDMEngine:
             "negative_prompt": negative_prompt,
             "num_inference_steps": steps,
             "generator": gen,
-            "width": gen_width,
-            "height": gen_height,
             "max_sequence_length": max_seq_len
         }
+
+        if src_image is not None and self.task == "i2v":
+            processed_image, new_gen_height, new_gen_width = self.i2v_image_processor(src_image, width=gen_width, height=gen_height)
+            kwargs["image"] = processed_image
+        elif src_image is not None and self.task == "i2i":
+            processed_image, new_gen_height, new_gen_width = self.i2i_image_processor(src_image, width=gen_width, height=gen_height)
+            kwargs["image"] = processed_image
+        else:
+            new_gen_height, new_gen_width = gen_height, gen_width
+
+        # 稀疏attention时，调整尺寸为block_size的倍数
+        if self.sparse_attn:
+            new_gen_height = (new_gen_height + self.sparse_attn.config.block_size - 1) // self.sparse_attn.config.block_size * self.sparse_attn.config.block_size
+            new_gen_width = (new_gen_width + self.sparse_attn.config.block_size - 1) // self.sparse_attn.config.block_size * self.sparse_attn.config.block_size
+
+        kwargs["width"] = new_gen_width
+        kwargs["height"] = new_gen_height
         
         # 处理特殊参数
-        if src_image is not None:
-            kwargs["image"] = src_image
-            
         if num_frames is not None:
             kwargs["num_frames"] = num_frames
             
@@ -751,3 +791,44 @@ class FastDMEngine:
         if num_frames is not None:
             return output.frames[0]
         return output.images[0]
+
+
+    def i2v_image_processor(self, input_image, width=832, height=480):
+        if isinstance(input_image, str):
+            if not os.path.isfile(input_image):
+                raise FileNotFoundError(f"Input image file does not exist: {input_image}")
+            image = load_image(input_image)
+        else:
+            image = input_image
+
+        max_area = height * width
+        aspect_ratio = image.height / image.width
+        mod_value = self.pipe.vae_scale_factor_spatial * self.pipe.transformer.config.patch_size[1]
+        height_ = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width_ = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        image = image.resize((width_, height_))
+        return image, height_, width_
+    
+    def i2i_image_processor(self, input_image, width=832, height=480):
+        # input_image is a bse64 encoded string or a file path
+        if isinstance(input_image, str):
+            if os.path.isfile(input_image):
+                image = load_image(input_image)
+            else:
+                image = input_image
+            
+            return image, image.height, image.width,
+
+        # input_image is a list of base64 encoded strings or file paths
+        elif isinstance(input_image, list):
+            images = []
+            for img in input_image:
+                if os.path.isfile(img):
+                    images.append(load_image(img))
+                else:
+                    images.append(img)
+            max_width = max(img.width for img in images)
+            max_height = max(img.height for img in images)
+            return images, max_height, max_width 
+        else:
+            raise ValueError("Input image must be a file path or a base64 encoded string")
