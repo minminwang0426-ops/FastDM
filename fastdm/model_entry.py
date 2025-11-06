@@ -10,10 +10,13 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 
-from diffusers import DiffusionPipeline, FluxPipeline
+from diffusers import DiffusionPipeline, FluxPipeline， WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline
+from diffusers.utils import load_image
 
 from fastdm.model.sdxl import SDXLUNetModelCore
 from fastdm.model.sd35 import SD3TransformerModelCore
